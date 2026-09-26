@@ -53,6 +53,11 @@
   菱形结构的有向图上找出每个可达包的**必经依赖**（支配者，任一路径都无法绕过）；
   再按每个必经包汇总其**独占支配**的下游包（支配树后代）及数量，结果稳定排序，
   `<root>` 不可达的包单列。
+- **环境矩阵分析**：`POST /analyze/environment-matrix` 接收与 `/resolve` 相同的
+  `packages`、`root`、`locks`、`allow_prereleases`、`max_attempts`，外加 2～8 个
+  名称唯一的环境（各自带 `marker_env`），对每个环境**独立**解析同一组根需求与
+  传递依赖（PEP 508 标记按各环境求值，一个环境触顶或冲突不影响其他环境），并仅
+  对成功环境汇总版本矩阵——区分“缺席”与具体版本，列出版本或存在性不同的包。
 
 ## 一条命令启动
 
@@ -71,6 +76,7 @@ docker compose up --build
 - `POST /audit/licenses` — 用本地许可证策略审计已解析的包
 - `POST /audit/dependency-chokepoints` — 审计依赖图的必经依赖（支配者/关键节点）
 - `POST /plan/rebuild` — 为本地变更包生成确定性的重建计划
+- `POST /analyze/environment-matrix` — 在多个标记环境下独立解析并汇总版本矩阵
 - `POST /jobs` — 提交异步解析作业（立即返回 `202` 与作业 ID）
 - `GET /jobs/{id}` — 查询作业状态与最终响应
 - `DELETE /jobs/{id}` — 取消作业
@@ -561,6 +567,103 @@ curl -s -X POST localhost:8000/diagnose/root-conflict \
 求解与全部复算实际求值的候选次数）。注意最小冲突集合不唯一时，结果取决于上述
 稳定删除顺序，但恒为“删任一条即可解”的最小集合。
 
+## 环境矩阵分析 API
+
+`POST /analyze/environment-matrix` 接收与 `/resolve` 相同的 `packages`、`root`、
+`locks`、`allow_prereleases`、`max_attempts`（校验规则完全一致；**不含**顶层
+`marker_env`），外加 2～8 个名称唯一的环境，每个环境带自己的可选 `marker_env`。
+服务对每个环境**独立**解析同一组根需求与传递依赖——PEP 508 标记按各环境的
+`marker_env` 求值——再对成功环境汇总版本矩阵：
+
+- 每个环境独立占用完整的 `max_attempts` 预算：某个环境触顶（`limit`）或冲突
+  （`conflict`）不影响其他环境的结果，各自的 `status` 与 `attempts` 都保留。
+- 每个环境的结果体与 `/resolve` 同形态：`ok` 时带 `resolved` / `dependency_graph`
+  / `locks`；`conflict` 时带结构化 `conflict`；`limit` 时另带
+  `error.code = "search_limit_exceeded"`。
+- 版本矩阵只汇总**成功**（`ok`）环境：每个包一行，`versions` 按环境名列出该环境
+  解析出的具体版本或 `null`（**缺席**，即该环境的解中不含此包）；`differences`
+  列出版本或存在性不同的包。成功环境少于两个时 `differences` 为空。
+- 环境一律按**输入顺序**出现，包按**规范名称**排序；相同输入永远得到相同输出。
+
+```bash
+curl -s -X POST localhost:8000/analyze/environment-matrix \
+  -H 'Content-Type: application/json' -d '{
+  "packages": {
+    "app": {"1.0": {"dependencies": [
+      "tomli>=1.0; python_version < '"'"'3.11'"'"'",
+      "common>=1.0"
+    ]}},
+    "tomli": {"1.0": {}, "2.0": {}},
+    "common": {"1.0": {}, "2.0": {}}
+  },
+  "root": ["app"],
+  "environments": [
+    {"name": "py310", "marker_env": {"python_version": "3.10"}},
+    {"name": "py311", "marker_env": {"python_version": "3.11"}}
+  ]
+}'
+```
+
+响应（HTTP 200；`dependency_graph` 从略）：
+
+```json
+{
+  "status": "ok",
+  "allow_prereleases": false,
+  "summary": {"environments": 2, "ok": 2, "conflict": 0, "limit": 0},
+  "environments": [
+    {
+      "name": "py310",
+      "status": "ok",
+      "attempts": 3,
+      "resolved": {"app": "1.0", "common": "2.0", "tomli": "2.0"},
+      "locks": {}
+    },
+    {
+      "name": "py311",
+      "status": "ok",
+      "attempts": 2,
+      "resolved": {"app": "1.0", "common": "2.0"},
+      "locks": {}
+    }
+  ],
+  "matrix": {
+    "environments": ["py310", "py311"],
+    "packages": [
+      {"package": "app", "versions": {"py310": "1.0", "py311": "1.0"}},
+      {"package": "common", "versions": {"py310": "2.0", "py311": "2.0"}},
+      {"package": "tomli", "versions": {"py310": "2.0", "py311": null}}
+    ],
+    "differences": ["tomli"]
+  }
+}
+```
+
+请求字段：
+
+- `packages` / `root` / `locks` / `allow_prereleases` / `max_attempts`：与
+  `/resolve` 完全相同（见[请求格式](#请求格式)）。
+- `environments`：2～8 个环境，按输入顺序比较。每项含：
+  - `name`：非空标签，请求内必须唯一；
+  - `marker_env`：可选，该环境的 PEP 508 标记求值覆盖（在固定的默认环境上
+    叠加，语义与 `/resolve` 的 `marker_env` 一致）。
+
+响应字段：
+
+- `environments`：每个环境一项（输入顺序），含 `name`、`status`
+  （`ok` / `conflict` / `limit`）、`attempts` 及该状态对应的 `/resolve` 式结果体。
+- `matrix.environments`：参与矩阵的成功环境名（输入顺序）。
+- `matrix.packages`：在任一成功环境中出现过的每个包一行（按规范名称排序），
+  `versions` 逐环境给出版本或 `null`。
+- `matrix.differences`：版本或存在性在成功环境间不一致的包（按规范名称排序）；
+  成功环境少于两个时为空。
+
+校验规则（与 `/resolve` 相同的输入校验全部复用）：
+
+- `packages` / `root` / `locks` 非法时返回与 `/resolve` 相同的 `400`；
+- 环境数量不在 2～8、缺 `name`、名字为空或含多余字段时返回 `422`；
+- 环境名重复时返回 `400`（`invalid_request`）。
+
 ## 数据持久化
 
 异步作业保存在 SQLite（WAL 模式），数据库路径由环境变量 `RESOLVER_DB` 控制，
@@ -574,7 +677,9 @@ curl -s -X POST localhost:8000/diagnose/root-conflict \
 
 ## 请求格式
 
-`/resolve`、`POST /jobs` 与 `/diagnose/root-conflict` 使用**完全相同**的请求体：
+`/resolve`、`POST /jobs` 与 `/diagnose/root-conflict` 使用**完全相同**的请求体
+（`/analyze/environment-matrix` 在此基础上把顶层 `marker_env` 换成 2～8 个各自
+携带 `marker_env` 的 `environments`，其余字段一致）：
 
 ```json
 {
@@ -721,13 +826,14 @@ app/
   resolver.py       # PEP 440/508 解析、候选排序、回溯求解器、冲突数据结构、取消点
   serialize.py      # 冲突树 / 终态冲突的 JSON 序列化
   diagnose.py       # 根需求冲突诊断：逐条暂删+复算的最小冲突根集合（搜索触顶返回未确定）
+  environment_matrix.py # 环境矩阵：多标记环境独立求解、成功环境版本矩阵与差异汇总
   audit.py          # 漏洞审计：公告匹配、图一致性校验、<root> 最短路径枚举
   chokepoint_audit.py # 关键节点审计：可达性、支配者不动点、支配树与独占支配汇总
   license_audit.py  # 许可证审计：SPDX 表达式解析、AND/OR/WITH 策略求值、决定性标识符
   rebuild.py        # 重建计划：反向依赖传播、Tarjan 环压缩、依赖优先并行 stages、最短反向路径
   jobs.py           # SQLite 作业存储、BEGIN IMMEDIATE 原子领取、后台 worker
-  main.py           # FastAPI 应用与 /resolve、/diagnose/root-conflict、/audit/*、/plan/rebuild、/jobs、/health
-tests/              # 端到端 API 测试（含漏洞、关键节点、许可证审计与重建计划）、根冲突诊断测试（含随机暴力对照）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
+  main.py           # FastAPI 应用与 /resolve、/diagnose/root-conflict、/audit/*、/plan/rebuild、/analyze/environment-matrix、/jobs、/health
+tests/              # 端到端 API 测试（含漏洞、关键节点、许可证审计、重建计划与环境矩阵）、根冲突诊断测试（含随机暴力对照）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
 data/               # 运行时生成：SQLite 数据库（RESOLVER_DB，已 gitignore）
 Dockerfile
 docker-compose.yml
