@@ -53,6 +53,12 @@
   菱形结构的有向图上找出每个可达包的**必经依赖**（支配者，任一路径都无法绕过）；
   再按每个必经包汇总其**独占支配**的下游包（支配树后代）及数量，结果稳定排序，
   `<root>` 不可达的包单列。
+- **多环境版本矩阵**：`POST /analyze/environment-matrix` 接收与 `/resolve` 相同的
+  `packages`、`root`、`locks`、`allow_prereleases`、`max_attempts`，外加 **2～8 个
+  名称唯一**的环境（每个环境给出 `name` 与 `marker_env`）。各环境独立按 PEP 508
+  标记解析根需求与全部传递依赖，分别保留自己的 `ok` / `conflict` / `limit` 结果与
+  `attempts`，一个环境冲突或触顶绝不影响其他环境；仅对成功环境汇总版本矩阵，
+  缺席记为 `null`（区别于具体版本），并列出版本或存在性不同的包。
 
 ## 一条命令启动
 
@@ -64,8 +70,9 @@ docker compose up --build
 
 服务监听 **http://localhost:8000**：
 
-- `GET /health` — 健康检查
+- `GET /health` — 健康检查（浏览器直接访问 http://localhost:8000/health 即可验证）
 - `POST /resolve` — 同步解析依赖（保持原有行为不变）
+- `POST /analyze/environment-matrix` — 多环境（PEP 508 标记）独立解析与版本矩阵
 - `POST /diagnose/root-conflict` — 诊断最小冲突根需求集合（与 `/resolve` 同请求体）
 - `POST /audit/vulnerabilities` — 用本地公告列表审计已解析的依赖图
 - `POST /audit/licenses` — 用本地许可证策略审计已解析的包
@@ -561,6 +568,101 @@ curl -s -X POST localhost:8000/diagnose/root-conflict \
 求解与全部复算实际求值的候选次数）。注意最小冲突集合不唯一时，结果取决于上述
 稳定删除顺序，但恒为“删任一条即可解”的最小集合。
 
+## 多环境版本矩阵 API
+
+`POST /analyze/environment-matrix` 用于回答：**同一组根需求在不同 PEP 508 环境下
+会解析出怎样不同的依赖集合与版本？** 它接收与 `/resolve` 相同的 `packages`、
+`root`、`locks`、`allow_prereleases`、`max_attempts`（校验规则也完全一致，复用同一
+套 PEP 440/508 解析），但**不接收**顶层 `marker_env`，而是额外接收 `environments`：
+2～8 个环境，每个环境含：
+
+- `name`：环境名称，**非空且彼此唯一**（重复或为空返回 `400`，错误体与
+  `/resolve` 相同）；
+- `marker_env`：该环境的 PEP 508 标记覆盖值（可省略，省略时使用解析器内置的固定
+  默认环境）。
+
+每个环境都**独立**调用同一确定性解析器：根需求与传递依赖中的
+`; python_version ...`、`; sys_platform ...` 等标记按该环境的 `marker_env` 求值，
+各环境分别保留自己的 `status`（`ok` / `conflict` / `limit`）、`attempts`、
+`resolved`、`dependency_graph`、`locks` 以及（失败时的）`conflict`。一个环境无解或
+触顶**绝不影响**其他环境；触顶环境同样带 `search_limit_exceeded` 错误体。
+环境按**输入顺序**返回。
+
+```bash
+curl -s -X POST localhost:8000/analyze/environment-matrix \
+  -H 'Content-Type: application/json' -d '{
+  "packages": {
+    "app": {"1.0": {"dependencies": [
+      "new-lib>=2.0; python_version >= '\''3.11'\''",
+      "win-tool; sys_platform == '\''win32'\''"
+    ]}},
+    "new-lib": {"1.0": {}, "2.0": {}},
+    "win-tool": {"1.0": {}}
+  },
+  "root": ["app"],
+  "environments": [
+    {"name": "linux-py310", "marker_env": {"python_version": "3.10", "python_full_version": "3.10.0"}},
+    {"name": "linux-py311", "marker_env": {"python_version": "3.11", "python_full_version": "3.11.0"}},
+    {"name": "windows-py311", "marker_env": {"python_version": "3.11", "python_full_version": "3.11.0", "sys_platform": "win32"}}
+  ]
+}'
+```
+
+响应（HTTP 始终为 **200**，由各环境条目的 `status` 区分成败；请求体非法时与
+`/resolve` 一样返回 `400/422`）：
+
+```json
+{
+  "status": "ok",
+  "summary": {"environments": 3, "ok": 3, "conflict": 0, "limit": 0},
+  "allow_prereleases": false,
+  "environments": [
+    {"name": "linux-py310", "marker_env": {"python_version": "3.10", "python_full_version": "3.10.0"},
+     "status": "ok", "attempts": 1, "resolved": {"app": "1.0"}, "dependency_graph": [ ... ], "locks": {}},
+    {"name": "linux-py311", "marker_env": {"python_version": "3.11", "python_full_version": "3.11.0"},
+     "status": "ok", "attempts": 2,
+     "resolved": {"app": "1.0", "new-lib": "2.0"}, "dependency_graph": [ ... ], "locks": {}},
+    {"name": "windows-py311",
+     "marker_env": {"python_version": "3.11", "python_full_version": "3.11.0", "sys_platform": "win32"},
+     "status": "ok", "attempts": 3,
+     "resolved": {"app": "1.0", "new-lib": "2.0", "win-tool": "1.0"},
+     "dependency_graph": [ ... ], "locks": {}}
+  ],
+  "matrix": {
+    "environments": ["linux-py310", "linux-py311", "windows-py311"],
+    "successful_count": 3,
+    "packages": [
+      {"package": "app", "differs": false, "versions": [
+        {"environment": "linux-py310", "version": "1.0"},
+        {"environment": "linux-py311", "version": "1.0"},
+        {"environment": "windows-py311", "version": "1.0"}]},
+      {"package": "new-lib", "differs": true, "versions": [
+        {"environment": "linux-py310", "version": null},
+        {"environment": "linux-py311", "version": "2.0"},
+        {"environment": "windows-py311", "version": "2.0"}]},
+      {"package": "win-tool", "differs": true, "versions": [
+        {"environment": "linux-py310", "version": null},
+        {"environment": "linux-py311", "version": null},
+        {"environment": "windows-py311", "version": "1.0"}]}
+    ],
+    "differences": ["new-lib", "win-tool"]
+  }
+}
+```
+
+版本矩阵规则：
+
+- 仅汇总**成功环境**（`status == "ok"`）；冲突或触顶环境不进入矩阵，但仍完整列在
+  `environments` 中。
+- 包取各成功环境 `resolved` 的并集，按**规范化包名**排序；矩阵内环境保持输入顺序。
+- 某环境中**缺席**的包记为 `"version": null`，与任何具体版本字符串严格区分——因此
+  “某环境多装一个条件依赖”与“两个环境选了不同版本”都会被识别为差异。
+- `differs` 标记该包在成功环境间版本（或存在性）是否不同；`differences` 列出全部
+  此类包名（按规范化名称排序）。
+- **成功环境少于两个时差异恒为空**：没有可比对象，`differences` 为 `[]` 且所有
+  `differs` 为 `false`（矩阵仍照列唯一成功环境的版本；全部失败时矩阵为空）。
+- 结果完全确定：相同输入（含环境顺序）永远得到相同输出。
+
 ## 数据持久化
 
 异步作业保存在 SQLite（WAL 模式），数据库路径由环境变量 `RESOLVER_DB` 控制，
@@ -600,6 +702,11 @@ curl -s -X POST localhost:8000/diagnose/root-conflict \
 - `allow_prereleases`：可选，默认 `false`。
 - `marker_env`：可选，覆盖标记求值环境。
 - `max_attempts`：可选，候选求值上限（默认 100000）。
+
+`POST /analyze/environment-matrix` 复用上述 `packages`、`root`、`locks`、
+`allow_prereleases`、`max_attempts`（不含顶层 `marker_env`），改为接收
+`environments`：2～8 个 `{"name": "<唯一名>", "marker_env": {...}}`，详见
+[多环境版本矩阵 API](#多环境版本矩阵-api)。
 
 ### 成功响应（200）
 
@@ -721,13 +828,14 @@ app/
   resolver.py       # PEP 440/508 解析、候选排序、回溯求解器、冲突数据结构、取消点
   serialize.py      # 冲突树 / 终态冲突的 JSON 序列化
   diagnose.py       # 根需求冲突诊断：逐条暂删+复算的最小冲突根集合（搜索触顶返回未确定）
+  environment_matrix.py # 多环境独立解析与版本矩阵：各环境保留 ok/conflict/limit 与 attempts，差异汇总
   audit.py          # 漏洞审计：公告匹配、图一致性校验、<root> 最短路径枚举
   chokepoint_audit.py # 关键节点审计：可达性、支配者不动点、支配树与独占支配汇总
   license_audit.py  # 许可证审计：SPDX 表达式解析、AND/OR/WITH 策略求值、决定性标识符
   rebuild.py        # 重建计划：反向依赖传播、Tarjan 环压缩、依赖优先并行 stages、最短反向路径
   jobs.py           # SQLite 作业存储、BEGIN IMMEDIATE 原子领取、后台 worker
-  main.py           # FastAPI 应用与 /resolve、/diagnose/root-conflict、/audit/*、/plan/rebuild、/jobs、/health
-tests/              # 端到端 API 测试（含漏洞、关键节点、许可证审计与重建计划）、根冲突诊断测试（含随机暴力对照）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
+  main.py           # FastAPI 应用与 /resolve、/analyze/environment-matrix、/diagnose/root-conflict、/audit/*、/plan/rebuild、/jobs、/health
+tests/              # 端到端 API 测试（含漏洞、关键节点、许可证审计、重建计划与多环境矩阵）、根冲突诊断测试（含随机暴力对照）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
 data/               # 运行时生成：SQLite 数据库（RESOLVER_DB，已 gitignore）
 Dockerfile
 docker-compose.yml

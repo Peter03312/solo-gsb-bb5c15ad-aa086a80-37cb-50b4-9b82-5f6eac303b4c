@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .audit import run_audit
 from .chokepoint_audit import run_dependency_chokepoints
 from .diagnose import run_root_conflict_diagnosis
+from .environment_matrix import run_environment_matrix
 from .license_audit import run_license_audit
 from .jobs import (
     CANCELLED,
@@ -35,7 +36,7 @@ from .serialize import conflict_summary
 DEFAULT_DB_PATH = os.path.join("data", "jobs.db")
 
 
-class ResolveRequest(BaseModel):
+class ResolveRequestBase(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     packages: dict[str, dict[str, Any]] = Field(
@@ -58,13 +59,38 @@ class ResolveRequest(BaseModel):
         default=False,
         description="Include a/b/rc pre-releases for every package when true.",
     )
+    max_attempts: int = Field(
+        default=100_000, ge=1, le=10_000_000,
+        description="Bound on candidate evaluations to keep resolution finite.",
+    )
+
+
+class ResolveRequest(ResolveRequestBase):
     marker_env: Optional[dict[str, str]] = Field(
         default=None,
         description="Override values for PEP 508 environment marker evaluation.",
     )
-    max_attempts: int = Field(
-        default=100_000, ge=1, le=10_000_000,
-        description="Bound on candidate evaluations to keep resolution finite.",
+
+
+class EnvironmentSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, description="Unique environment name.")
+    marker_env: dict[str, str] = Field(
+        default_factory=dict,
+        description="Override values for PEP 508 environment marker evaluation.",
+    )
+
+
+class EnvironmentMatrixRequest(ResolveRequestBase):
+    environments: list[EnvironmentSpec] = Field(
+        ...,
+        min_length=2,
+        max_length=8,
+        description=(
+            "2 to 8 uniquely named environments; each is solved independently "
+            "with its own PEP 508 marker overrides."
+        ),
     )
 
 
@@ -187,7 +213,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Local PEP 440 Dependency Resolver",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "Resolves transitive dependencies from a self-contained package index. "
         "No external package index or account is used."
@@ -201,7 +227,7 @@ async def _input_error_handler(_request: Request, exc: ResolutionInputError) -> 
     return JSONResponse(status_code=400, content={"error": {"code": "invalid_request", "message": str(exc)}})
 
 
-def _parse_input(payload: ResolveRequest):
+def _parse_input(payload: ResolveRequestBase):
     """Parse and semantically validate a request.
 
     Cheap (no solving), so it can run synchronously on both ``/resolve`` and
@@ -320,6 +346,38 @@ async def diagnose_root_conflict_endpoint(payload: ResolveRequest) -> JSONRespon
         locks,
         allow_prereleases=payload.allow_prereleases,
         marker_env=payload.marker_env,
+        max_attempts=payload.max_attempts,
+    )
+    return JSONResponse(status_code=200, content=body)
+
+
+@app.post("/analyze/environment-matrix")
+async def environment_matrix_endpoint(payload: EnvironmentMatrixRequest) -> JSONResponse:
+    """Resolve the same requirements independently for several environments.
+
+    Accepts the same ``packages``, ``root``, ``locks``,
+    ``allow_prereleases`` and ``max_attempts`` as ``/resolve``, plus 2-8
+    uniquely named environments, each with its own ``marker_env`` overrides.
+    The root requirements and transitive dependencies are re-solved for
+    every environment under its PEP 508 markers, and each environment keeps
+    its own ``ok`` / ``conflict`` / ``limit`` result and ``attempts``: a
+    conflict or a search-limit hit in one environment never affects the
+    others.
+
+    Only successful environments feed the version matrix.  Absence (the
+    package was not demanded under that environment's markers) is reported
+    as ``null``, distinct from a concrete version; packages whose versions
+    or existence differ across the successful environments are listed under
+    ``differences`` (empty when fewer than two environments succeed).
+    Environments stay in input order and packages sort by canonical name.
+    """
+    index, entries, locks = _parse_input(payload)
+    body = run_environment_matrix(
+        index,
+        entries,
+        locks,
+        payload.environments,
+        allow_prereleases=payload.allow_prereleases,
         max_attempts=payload.max_attempts,
     )
     return JSONResponse(status_code=200, content=body)
